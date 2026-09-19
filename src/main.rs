@@ -1,4 +1,5 @@
 mod diagnostics;
+mod fix;
 mod line_index;
 mod rules;
 
@@ -18,6 +19,13 @@ struct Cli {
     /// Files or directories to lint. Defaults to the current directory.
     #[arg(default_value = ".")]
     paths: Vec<PathBuf>,
+
+    /// Remove fully-unused import statements (F401 only). Prints a diff of
+    /// what will be removed before writing the file. Only whole, single-line
+    /// import statements where every bound name is unused are touched;
+    /// partially-unused or multi-line imports are left for manual review.
+    #[arg(long)]
+    fix: bool,
 }
 
 fn collect_python_files(paths: &[PathBuf]) -> Vec<PathBuf> {
@@ -40,8 +48,29 @@ fn collect_python_files(paths: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-fn lint_file(path: &Path) -> anyhow::Result<Vec<diagnostics::Diagnostic>> {
-    let source = std::fs::read_to_string(path)?;
+fn lint_file(path: &Path, apply_fix: bool) -> anyhow::Result<Vec<diagnostics::Diagnostic>> {
+    let mut source = std::fs::read_to_string(path)?;
+
+    if apply_fix {
+        let line_index = LineIndex::new(&source);
+        let fixes = fix::find_unused_import_fixes(&source, &line_index)?;
+        if !fixes.is_empty() {
+            println!("{}", format!("--- {}", path.display()).bold());
+            print!("{}", fix::render_diff(&source, &fixes));
+            source = fix::apply_fixes(&source, &fixes);
+            std::fs::write(path, &source)?;
+            println!(
+                "{}",
+                format!(
+                    "applied {} fix{}",
+                    fixes.len(),
+                    if fixes.len() == 1 { "" } else { "es" }
+                )
+                .green()
+            );
+        }
+    }
+
     let line_index = LineIndex::new(&source);
     rules::check(path, &source, &line_index)
 }
@@ -59,7 +88,7 @@ fn main() -> ExitCode {
     let mut had_error = false;
 
     for file in &files {
-        match lint_file(file) {
+        match lint_file(file, cli.fix) {
             Ok(diags) => {
                 total += diags.len();
                 for diag in diags {

@@ -25,6 +25,20 @@ cargo run -- path/to/file_or_directory
 
 With no arguments, it lints the current directory recursively.
 
+### Auto-fix (prototype, F401 only)
+
+```sh
+cargo run -- --fix path/to/file_or_directory
+```
+
+Detects fully-unused `import`/`from ... import ...` statements, prints a diff
+of the line(s) it will remove, then applies the change and re-lints the
+result. Scope is intentionally narrow for safety: only whole, single-line
+import statements where *every* bound name is unused are touched. A
+`from x import a, b` statement where only `a` is dead, or an import that
+spans multiple lines, is left alone for manual review rather than risk an
+unsafe edit. Nothing else in the file is modified.
+
 Exit codes: `0` no issues, `1` issues found, `2` a file failed to parse/read.
 
 ## Building
