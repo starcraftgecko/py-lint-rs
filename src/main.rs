@@ -60,17 +60,30 @@ fn lint_file(path: &Path, apply_fix: bool) -> anyhow::Result<Vec<diagnostics::Di
         if !fixes.is_empty() {
             println!("{}", format!("--- {}", path.display()).bold());
             print!("{}", fix::render_diff(&source, &fixes));
-            source = fix::apply_fixes(&source, &fixes);
-            std::fs::write(path, &source)?;
-            println!(
-                "{}",
-                format!(
-                    "applied {} fix{}",
-                    fixes.len(),
-                    if fixes.len() == 1 { "" } else { "es" }
-                )
-                .green()
-            );
+            match fix::apply_fixes(&source, &fixes) {
+                Ok(fixed) => {
+                    source = fixed;
+                    std::fs::write(path, &source)?;
+                    println!(
+                        "{}",
+                        format!(
+                            "applied {} fix{}",
+                            fixes.len(),
+                            if fixes.len() == 1 { "" } else { "es" }
+                        )
+                        .green()
+                    );
+                }
+                Err(reasons) => {
+                    println!(
+                        "{}",
+                        "refusing to apply any fixes to this file:".red().bold()
+                    );
+                    for reason in reasons {
+                        println!("  {} {reason}", "-".red());
+                    }
+                }
+            }
         }
     }
 

@@ -9,10 +9,16 @@ use crate::line_index::LineIndex;
 ///
 /// A `Fix` is either a whole-line deletion (`replacement` empty, `start`/`end`
 /// span a full physical line including its trailing newline) or an in-place
-/// substitution (`start`/`end` span just the token being replaced). Both
-/// shapes are applied and diffed through the same two functions - that
-/// reuse is the point: adding a new fixer means writing a new `find_*`
-/// function, not a new apply/diff engine.
+/// substitution or insertion (`start`/`end` span just the token being
+/// replaced, or are equal for a pure insertion). All shapes are applied and
+/// diffed through the same two functions - that reuse is the point: adding a
+/// new fixer means writing a new `find_*` function, not a new apply/diff
+/// engine.
+///
+/// `expected` is a snapshot of exactly what `start..end` contained in the
+/// source *at the moment this fix was computed*. `apply_fixes` re-checks it
+/// against whatever source it's actually given before touching anything -
+/// see the note there for why.
 #[derive(Debug, Clone)]
 pub struct Fix {
     pub line: usize,
@@ -20,6 +26,83 @@ pub struct Fix {
     start: usize,
     end: usize,
     replacement: String,
+    expected: String,
+}
+
+impl Fix {
+    fn new(source: &str, line: usize, description: String, start: usize, end: usize, replacement: String) -> Self {
+        Self {
+            line,
+            description,
+            start,
+            end,
+            replacement,
+            expected: source[start..end].to_string(),
+        }
+    }
+}
+
+/// Why `apply_fixes` declined to touch a file, in enough detail that a
+/// human or another agent can tell exactly what happened without guessing.
+/// Deliberately not "clever" about any of these: no fuzzy matching, no
+/// automatic reordering, no partial application. If it's ambiguous, refuse
+/// and say why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The fix's target range no longer exists in the given source at all
+    /// (e.g. the file got shorter, or the offset no longer lands on a
+    /// character boundary).
+    OutOfBounds { line: usize, description: String },
+    /// The fix's target range still exists, but its contents differ from
+    /// what was recorded when the fix was computed - the file changed
+    /// since detection. This tool never attempts a "close enough" fuzzy
+    /// re-apply; an exact match is required or the fix is refused.
+    StaleContent {
+        line: usize,
+        description: String,
+        expected: String,
+        found: String,
+    },
+    /// Two fixes target overlapping byte ranges, or share the exact same
+    /// start offset (e.g. two independent insertions at the same point).
+    /// Which one should logically come first is ambiguous - and guessing
+    /// wrong here isn't a cosmetic error, it can panic or scramble output
+    /// - so neither is applied.
+    Overlap {
+        first_line: usize,
+        first_description: String,
+        second_line: usize,
+        second_description: String,
+    },
+}
+
+impl std::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefusalReason::OutOfBounds { line, description } => write!(
+                f,
+                "line {line} ({description}): target range no longer exists in this file"
+            ),
+            RefusalReason::StaleContent {
+                line,
+                description,
+                expected,
+                found,
+            } => write!(
+                f,
+                "line {line} ({description}): expected to find {expected:?} but the file now has {found:?} - it changed since this fix was computed"
+            ),
+            RefusalReason::Overlap {
+                first_line,
+                first_description,
+                second_line,
+                second_description,
+            } => write!(
+                f,
+                "line {first_line} ({first_description}) collides with line {second_line} ({second_description}) - which should apply first is ambiguous"
+            ),
+        }
+    }
 }
 
 fn line_start_offset(source: &str, offset: usize) -> usize {
@@ -138,13 +221,16 @@ pub fn find_unused_import_fixes(source: &str, line_index: &LineIndex) -> anyhow:
             continue;
         }
 
-        fixes.push(Fix {
-            line: start_line,
-            description: format!("remove unused import: {}", names.join(", ")),
-            start: line_start_offset(source, *start),
-            end: line_end_offset_inclusive_newline(source, *end),
-            replacement: String::new(),
-        });
+        let del_start = line_start_offset(source, *start);
+        let del_end = line_end_offset_inclusive_newline(source, *end);
+        fixes.push(Fix::new(
+            source,
+            start_line,
+            format!("remove unused import: {}", names.join(", ")),
+            del_start,
+            del_end,
+            String::new(),
+        ));
     }
 
     fixes.sort_by_key(|f| f.start);
@@ -237,13 +323,14 @@ pub fn find_none_comparison_fixes(source: &str, line_index: &LineIndex) -> anyho
 
         let replacement = if is_eq { "is" } else { "is not" };
         let (line, _) = line_index.line_col(op_start);
-        fixes.push(Fix {
+        fixes.push(Fix::new(
+            source,
             line,
-            description: format!("replace `{needle}` with `{replacement}` for None comparison"),
-            start: op_start,
-            end: op_end,
-            replacement: replacement.to_string(),
-        });
+            format!("replace `{needle}` with `{replacement}` for None comparison"),
+            op_start,
+            op_end,
+            replacement.to_string(),
+        ));
     }
 
     fixes.sort_by_key(|f| f.start);
@@ -369,20 +456,22 @@ impl<'a> MutableDefaultCollector<'a> {
             format!("{indent}if {param_name} is None:\n{indent}{indent}{param_name} = {default_text}\n");
         let (insert_line, _) = self.line_index.line_col(insert_at);
 
-        self.fixes.push(Fix {
-            line: default_start_line,
-            description: format!("replace mutable default for `{param_name}` with `None`"),
-            start: default_start,
-            end: default_end,
-            replacement: "None".to_string(),
-        });
-        self.fixes.push(Fix {
-            line: insert_line,
-            description: format!("initialize `{param_name}` inside the function body instead"),
-            start: insert_at,
-            end: insert_at,
-            replacement: insert_text,
-        });
+        self.fixes.push(Fix::new(
+            self.source,
+            default_start_line,
+            format!("replace mutable default for `{param_name}` with `None`"),
+            default_start,
+            default_end,
+            "None".to_string(),
+        ));
+        self.fixes.push(Fix::new(
+            self.source,
+            insert_line,
+            format!("initialize `{param_name}` inside the function body instead"),
+            insert_at,
+            insert_at,
+            insert_text,
+        ));
     }
 }
 
@@ -480,10 +569,68 @@ pub fn render_diff(source: &str, fixes: &[Fix]) -> String {
     out
 }
 
-/// Applies the fixes to `source`, returning the new file contents.
-pub fn apply_fixes(source: &str, fixes: &[Fix]) -> String {
+/// Applies the fixes to `source`, returning the new file contents - or every
+/// reason it refused to, if any.
+///
+/// This is the actual safety boundary, not `--fix`'s diff preview: a
+/// `Fix`'s `start`/`end` are just numbers by the time they get here, with no
+/// guarantee the source handed to this function is the same one they were
+/// computed against (a concurrent edit, a stale cache, a caller reusing an
+/// old fix list - the reason doesn't matter). Before changing anything, this
+/// verifies, for every fix:
+///
+/// - its range still exists in `source` at all (`OutOfBounds`),
+/// - the text there still matches exactly what was recorded when the fix
+///   was computed - no fuzzy "close enough" matching (`StaleContent`),
+/// - it doesn't overlap, or start at the exact same point as, any other
+///   fix in the batch (`Overlap`) - this includes two zero-width insertions
+///   claiming the same spot, which is a real case: an unused import as a
+///   function's first statement, in a function that also needs its mutable
+///   default fixed, produces exactly this collision (F401 wants to delete
+///   that line; B006 wants to insert new lines "before" that same
+///   statement). Picking an order automatically risks doing it wrong
+///   silently - or worse, panicking mid-write - so both are refused instead.
+///
+/// If *any* fix in the batch fails a check, none of them are applied - the
+/// caller gets every reason back so a human (or another agent) can see
+/// exactly why, rather than a partially-applied file or a bare crash.
+pub fn apply_fixes(source: &str, fixes: &[Fix]) -> Result<String, Vec<RefusalReason>> {
     let mut sorted = fixes.to_vec();
     sorted.sort_by_key(|f| f.start);
+
+    let mut reasons = Vec::new();
+
+    for pair in sorted.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if a.end > b.start || a.start == b.start {
+            reasons.push(RefusalReason::Overlap {
+                first_line: a.line,
+                first_description: a.description.clone(),
+                second_line: b.line,
+                second_description: b.description.clone(),
+            });
+        }
+    }
+
+    for fix in &sorted {
+        match source.get(fix.start..fix.end) {
+            None => reasons.push(RefusalReason::OutOfBounds {
+                line: fix.line,
+                description: fix.description.clone(),
+            }),
+            Some(found) if found != fix.expected => reasons.push(RefusalReason::StaleContent {
+                line: fix.line,
+                description: fix.description.clone(),
+                expected: fix.expected.clone(),
+                found: found.to_string(),
+            }),
+            Some(_) => {}
+        }
+    }
+
+    if !reasons.is_empty() {
+        return Err(reasons);
+    }
 
     let mut result = String::with_capacity(source.len());
     let mut last = 0usize;
@@ -493,7 +640,7 @@ pub fn apply_fixes(source: &str, fixes: &[Fix]) -> String {
         last = fix.end;
     }
     result.push_str(&source[last..]);
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -510,6 +657,14 @@ mod tests {
         find_none_comparison_fixes(source, &line_index).expect("test source should parse")
     }
 
+    /// Applies fixes and unwraps, for tests where the fixes are computed
+    /// fresh against the exact same source they're applied to - staleness
+    /// and overlap simply can't occur by construction, so a failure here
+    /// would mean a real bug, not an expected refusal.
+    fn apply_clean(source: &str, fixes: &[Fix]) -> String {
+        apply_fixes(source, fixes).expect("fixes computed fresh against this source must apply cleanly")
+    }
+
     // -- F401 -----------------------------------------------------------
 
     #[test]
@@ -517,7 +672,7 @@ mod tests {
         let source = "import os\nprint(1)\n";
         let f = import_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "print(1)\n");
+        assert_eq!(apply_clean(source, &f), "print(1)\n");
     }
 
     #[test]
@@ -525,7 +680,7 @@ mod tests {
         let source = "from collections import OrderedDict\nprint(1)\n";
         let f = import_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "print(1)\n");
+        assert_eq!(apply_clean(source, &f), "print(1)\n");
     }
 
     #[test]
@@ -533,7 +688,7 @@ mod tests {
         let source = "import os\nprint(os.getcwd())\n";
         let f = import_fixes(source);
         assert!(f.is_empty());
-        assert_eq!(apply_fixes(source, &f), source);
+        assert_eq!(apply_clean(source, &f), source);
     }
 
     #[test]
@@ -564,7 +719,7 @@ mod tests {
         let source = "import os\nimport sys\nprint(sys.path)\n";
         let f = import_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "import sys\nprint(sys.path)\n");
+        assert_eq!(apply_clean(source, &f), "import sys\nprint(sys.path)\n");
     }
 
     #[test]
@@ -580,7 +735,7 @@ mod tests {
         let source = "if True:\n    import os\n    print(1)\n";
         let f = import_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "if True:\n    print(1)\n");
+        assert_eq!(apply_clean(source, &f), "if True:\n    print(1)\n");
     }
 
     #[test]
@@ -588,7 +743,7 @@ mod tests {
         let source = "import os\nimport json\nprint(1)\n";
         let f = import_fixes(source);
         assert_eq!(f.len(), 2);
-        assert_eq!(apply_fixes(source, &f), "print(1)\n");
+        assert_eq!(apply_clean(source, &f), "print(1)\n");
     }
 
     #[test]
@@ -616,7 +771,7 @@ mod tests {
         let source = "x = 1\nif x == None:\n    pass\n";
         let f = none_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "x = 1\nif x is None:\n    pass\n");
+        assert_eq!(apply_clean(source, &f), "x = 1\nif x is None:\n    pass\n");
     }
 
     #[test]
@@ -625,7 +780,7 @@ mod tests {
         let f = none_fixes(source);
         assert_eq!(f.len(), 1);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "x = 1\nif x is not None:\n    pass\n"
         );
     }
@@ -635,7 +790,7 @@ mod tests {
         let source = "x = 1\nif None == x:\n    pass\n";
         let f = none_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "x = 1\nif None is x:\n    pass\n");
+        assert_eq!(apply_clean(source, &f), "x = 1\nif None is x:\n    pass\n");
     }
 
     #[test]
@@ -643,7 +798,7 @@ mod tests {
         let source = "if get_value() == None:\n    pass\n";
         let f = none_fixes(source);
         assert_eq!(f.len(), 1);
-        assert_eq!(apply_fixes(source, &f), "if get_value() is None:\n    pass\n");
+        assert_eq!(apply_clean(source, &f), "if get_value() is None:\n    pass\n");
     }
 
     #[test]
@@ -683,7 +838,7 @@ mod tests {
         let f = none_fixes(source);
         assert_eq!(f.len(), 1);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "if very_long_descriptive_name is None:\n    pass\n"
         );
     }
@@ -697,7 +852,7 @@ mod tests {
         let mut all = find_unused_import_fixes(source, &line_index).unwrap();
         all.extend(find_none_comparison_fixes(source, &line_index).unwrap());
         assert_eq!(all.len(), 2);
-        assert_eq!(apply_fixes(source, &all), "x = 1\nif x is None:\n    pass\n");
+        assert_eq!(apply_clean(source, &all), "x = 1\nif x is None:\n    pass\n");
     }
 
     // -- B006 ---------------------------------------------------------------
@@ -713,7 +868,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def add(item, bucket=None):\n    \"\"\"Doc.\"\"\"\n    if bucket is None:\n        bucket = []\n    bucket.append(item)\n    return bucket\n"
         );
     }
@@ -724,7 +879,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def f(x=None):\n    if x is None:\n        x = {}\n    return x\n"
         );
     }
@@ -735,7 +890,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def f(x=None):\n    if x is None:\n        x = {1, 2}\n    return x\n"
         );
     }
@@ -746,7 +901,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "async def f(x=None):\n    if x is None:\n        x = []\n    return x\n"
         );
     }
@@ -757,7 +912,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def f(*, x=None):\n    if x is None:\n        x = []\n    return x\n"
         );
     }
@@ -770,7 +925,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def f(x=None):\n    \"\"\"Doc.\"\"\"\n    if x is None:\n        x = []\n"
         );
     }
@@ -781,7 +936,7 @@ mod tests {
         let f = mutable_default_fixes(source);
         assert_eq!(f.len(), 2);
         assert_eq!(
-            apply_fixes(source, &f),
+            apply_clean(source, &f),
             "def f(x=None):\n\tif x is None:\n\t\tx = []\n\treturn x\n"
         );
     }
@@ -843,10 +998,130 @@ mod tests {
         all.extend(find_mutable_default_fixes(source, &line_index).unwrap());
         assert_eq!(all.len(), 4); // 1 import delete + 1 compare rewrite + 2 for the mutable default
 
-        let fixed = apply_fixes(source, &all);
+        let fixed = apply_clean(source, &all);
         assert_eq!(
             fixed,
             "\n\ndef get(x, cache=None):\n    if cache is None:\n        cache = {}\n    if x is None:\n        return None\n    return cache.get(x)\n"
         );
+    }
+
+    // -- Hardened apply engine: explainable refusal ------------------------
+
+    #[test]
+    fn refuses_two_fixes_that_overlap() {
+        let source = "x = 1\n";
+        let fix_a = Fix::new(source, 1, "a".to_string(), 0, 5, "y".to_string());
+        let fix_b = Fix::new(source, 1, "b".to_string(), 3, 5, "z".to_string());
+        let err = apply_fixes(source, &[fix_a, fix_b]).unwrap_err();
+        assert_eq!(err.len(), 1);
+        assert!(matches!(err[0], RefusalReason::Overlap { .. }));
+        // The reason must actually say something a human can act on, not
+        // just "no" - both fixes' own descriptions should appear in it.
+        let message = err[0].to_string();
+        assert!(message.contains('a') && message.contains('b'));
+    }
+
+    #[test]
+    fn refuses_two_insertions_at_the_identical_point() {
+        // Two zero-width edits claiming the exact same offset - overlap by
+        // the `end > start` check alone wouldn't catch this (both spans are
+        // empty), so this is exactly the "shared start" branch.
+        let source = "x = 1\n";
+        let fix_a = Fix::new(source, 1, "insert A".to_string(), 3, 3, "AAA".to_string());
+        let fix_b = Fix::new(source, 1, "insert B".to_string(), 3, 3, "BBB".to_string());
+        let err = apply_fixes(source, &[fix_a, fix_b]).unwrap_err();
+        assert!(matches!(err[0], RefusalReason::Overlap { .. }));
+    }
+
+    #[test]
+    fn refuses_and_explains_a_real_cross_fixer_collision() {
+        // Not synthetic: an unused import as a function's very first
+        // statement, in a function that also needs its mutable default
+        // fixed. F401 wants to delete that line; B006 wants to insert its
+        // guard "before" that same statement - both land at the same
+        // offset. Before this hardening, this exact input panicked the
+        // whole tool (`byte range starts at 27 but ends at 13`) instead of
+        // refusing. Confirmed by reproducing it against the CLI before
+        // writing this test.
+        let source = "def f(x=[]):\n    import os\n    return x\n";
+        let line_index = LineIndex::new(source);
+        let mut fixes = find_unused_import_fixes(source, &line_index).unwrap();
+        fixes.extend(find_mutable_default_fixes(source, &line_index).unwrap());
+        assert_eq!(fixes.len(), 3);
+
+        let err = apply_fixes(source, &fixes).unwrap_err();
+        assert!(
+            err.iter().any(|r| matches!(r, RefusalReason::Overlap { .. })),
+            "expected an Overlap refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_stale_content_instead_of_corrupting_it() {
+        // Compute a fix against the original source, then "apply" it to a
+        // version of the file that changed in the meantime - simulating a
+        // concurrent edit or a caller reusing an old fix list.
+        let original = "import os\nprint(1)\n";
+        let f = import_fixes(original);
+        assert_eq!(f.len(), 1);
+
+        let changed_on_disk = "import sys\nprint(1)\n"; // same shape, different import
+        let err = apply_fixes(changed_on_disk, &f).unwrap_err();
+        assert_eq!(err.len(), 1);
+        match &err[0] {
+            RefusalReason::StaleContent { expected, found, .. } => {
+                assert_eq!(expected, "import os\n");
+                // "sys" is one byte longer than "os", so the same [start,end)
+                // byte range now lands one character short of the newline -
+                // itself a small illustration of why byte-range reuse across
+                // different content is unsafe without an exact-match check.
+                assert_eq!(found, "import sys");
+            }
+            other => panic!("expected StaleContent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_a_close_but_not_exact_match_rather_than_fuzzy_applying() {
+        // The kind of "diff that partially matches" a naive patch tool
+        // might be tempted to fuzzy-apply anyway: only a single character
+        // differs (an extra space), so a "close enough" heuristic could
+        // easily justify sliding the edit onto it. This tool does not do
+        // that - an exact match is required, or it refuses.
+        let original = "x = 1\nif x == None:\n    pass\n";
+        let f = none_fixes(original);
+        assert_eq!(f.len(), 1);
+
+        let slightly_different = "x = 1\nif x  == None:\n    pass\n"; // extra space before `==`
+        let err = apply_fixes(slightly_different, &f).unwrap_err();
+        assert!(
+            err.iter().any(|r| matches!(r, RefusalReason::StaleContent { .. })
+                || matches!(r, RefusalReason::OutOfBounds { .. })),
+            "a near-miss must be refused, not silently patched: {err:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_out_of_bounds_rather_than_panicking() {
+        // The file got shorter since the fix was computed - the recorded
+        // range doesn't exist in the new source at all.
+        let original = "import os\nprint(1)\n";
+        let f = import_fixes(original);
+        assert_eq!(f.len(), 1);
+
+        let truncated = "im";
+        let err = apply_fixes(truncated, &f).unwrap_err();
+        assert!(matches!(err[0], RefusalReason::OutOfBounds { .. }));
+    }
+
+    #[test]
+    fn clean_multi_fixer_batches_still_apply_with_no_refusals() {
+        // Sanity check that hardening the engine didn't make it paranoid
+        // about the ordinary, non-colliding case that composition relies on.
+        let source = "import os\nx = 1\nif x == None:\n    pass\n";
+        let line_index = LineIndex::new(source);
+        let mut all = find_unused_import_fixes(source, &line_index).unwrap();
+        all.extend(find_none_comparison_fixes(source, &line_index).unwrap());
+        assert!(apply_fixes(source, &all).is_ok());
     }
 }
