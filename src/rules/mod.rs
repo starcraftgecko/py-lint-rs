@@ -2,8 +2,9 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use rustpython_parser::ast::{
-    self as ast, Constant, Expr, ExprCompare, ExceptHandlerExceptHandler, Ranged,
-    StmtAsyncFunctionDef, StmtFunctionDef, StmtImport, StmtImportFrom, Suite, Visitor,
+    self as ast, Constant, Expr, ExprCompare, ExceptHandlerExceptHandler, Ranged, Stmt,
+    StmtAsyncFunctionDef, StmtClassDef, StmtFunctionDef, StmtImport, StmtImportFrom, Suite,
+    Visitor,
 };
 use rustpython_parser::Parse;
 
@@ -25,6 +26,7 @@ struct Checker<'a> {
     diagnostics: Vec<Diagnostic>,
     imports: Vec<PendingImport>,
     used_names: HashSet<String>,
+    scope_depth: u32,
 }
 
 impl<'a> Checker<'a> {
@@ -35,6 +37,7 @@ impl<'a> Checker<'a> {
             diagnostics: Vec::new(),
             imports: Vec::new(),
             used_names: HashSet::new(),
+            scope_depth: 0,
         }
     }
 
@@ -81,6 +84,27 @@ impl<'a> Checker<'a> {
 
     fn is_none_literal(expr: &Expr) -> bool {
         matches!(expr, Expr::Constant(c) if matches!(c.value, Constant::None))
+    }
+
+    fn has_docstring(body: &[Stmt]) -> bool {
+        matches!(
+            body.first(),
+            Some(Stmt::Expr(expr_stmt))
+                if matches!(expr_stmt.value.as_ref(), Expr::Constant(c) if matches!(c.value, Constant::Str(_)))
+        )
+    }
+
+    fn check_missing_docstring(&mut self, name: &str, body: &[Stmt], offset: usize) {
+        if name.starts_with('_') {
+            return;
+        }
+        if !Self::has_docstring(body) {
+            self.push(
+                offset,
+                "D103",
+                format!("public function `{name}` is missing a docstring"),
+            );
+        }
     }
 
     fn finish(mut self) -> Vec<Diagnostic> {
@@ -150,12 +174,36 @@ impl<'a> Visitor for Checker<'a> {
 
     fn visit_stmt_function_def(&mut self, node: StmtFunctionDef) {
         self.check_mutable_defaults(&node.args);
+        if self.scope_depth == 0 {
+            self.check_missing_docstring(
+                node.name.as_str(),
+                &node.body,
+                node.range().start().to_usize(),
+            );
+        }
+        self.scope_depth += 1;
         self.generic_visit_stmt_function_def(node);
+        self.scope_depth -= 1;
     }
 
     fn visit_stmt_async_function_def(&mut self, node: StmtAsyncFunctionDef) {
         self.check_mutable_defaults(&node.args);
+        if self.scope_depth == 0 {
+            self.check_missing_docstring(
+                node.name.as_str(),
+                &node.body,
+                node.range().start().to_usize(),
+            );
+        }
+        self.scope_depth += 1;
         self.generic_visit_stmt_async_function_def(node);
+        self.scope_depth -= 1;
+    }
+
+    fn visit_stmt_class_def(&mut self, node: StmtClassDef) {
+        self.scope_depth += 1;
+        self.generic_visit_stmt_class_def(node);
+        self.scope_depth -= 1;
     }
 
     fn visit_excepthandler_except_handler(&mut self, node: ExceptHandlerExceptHandler) {

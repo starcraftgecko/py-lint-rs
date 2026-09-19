@@ -15,6 +15,7 @@ and walks the AST looking for common issues.
 | `E711` | Comparison to `None` using `==`/`!=` instead of `is`/`is not` |
 | `E722` | Bare `except:` clause |
 | `E501` | Line too long (> 100 characters) |
+| `D103` | Public top-level function is missing a docstring (functions named with a leading `_` are ignored) |
 
 ## Usage
 

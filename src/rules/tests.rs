@@ -204,6 +204,72 @@ fn e501_ignores_short_line() {
 }
 
 // ---------------------------------------------------------------------
+// D103 - missing docstring on public top-level function
+// ---------------------------------------------------------------------
+
+#[test]
+fn d103_flags_public_function_without_docstring() {
+    let diags = lint("def greet(name):\n    return f\"hi {name}\"\n");
+    assert!(has(&diags, "D103"));
+}
+
+#[test]
+fn d103_flags_public_async_function_without_docstring() {
+    let diags = lint("async def greet(name):\n    return name\n");
+    assert!(has(&diags, "D103"));
+}
+
+#[test]
+fn d103_ignores_function_with_docstring() {
+    let diags = lint("def greet(name):\n    \"\"\"Greet someone by name.\"\"\"\n    return name\n");
+    assert!(!has(&diags, "D103"));
+}
+
+#[test]
+fn d103_ignores_single_underscore_function() {
+    let diags = lint("def _helper():\n    return 1\n");
+    assert!(!has(&diags, "D103"));
+}
+
+#[test]
+fn d103_ignores_dunder_function() {
+    let diags = lint("def __magic__():\n    return 1\n");
+    assert!(!has(&diags, "D103"));
+}
+
+#[test]
+fn d103_ignores_nested_function() {
+    // The outer function is flagged (public, no docstring), but the nested
+    // helper is not a top-level def and must not be flagged on its own.
+    let source = "def outer():\n    \"\"\"Outer docstring.\"\"\"\n    def inner():\n        return 1\n    return inner()\n";
+    let diags = lint(source);
+    assert_eq!(count(&diags, "D103"), 0);
+}
+
+#[test]
+fn d103_ignores_nested_function_missing_docstring_only_flags_outer() {
+    // Neither has a docstring; only the top-level `outer` should be flagged.
+    let source = "def outer():\n    def inner():\n        return 1\n    return inner()\n";
+    let diags = lint(source);
+    assert_eq!(count(&diags, "D103"), 1);
+}
+
+#[test]
+fn d103_ignores_class_methods() {
+    // Methods live inside a class body, not at module top level, so they
+    // are out of scope for this rule even though they lack docstrings.
+    let source = "class Greeter:\n    def greet(self):\n        return 1\n";
+    let diags = lint(source);
+    assert_eq!(count(&diags, "D103"), 0);
+}
+
+#[test]
+fn d103_ignores_empty_source() {
+    let diags = lint("");
+    assert!(!has(&diags, "D103"));
+}
+
+// ---------------------------------------------------------------------
 // Regression: locks in current behavior against the committed example
 // fixtures so future rule changes can't silently alter known-good output.
 // ---------------------------------------------------------------------
@@ -217,7 +283,8 @@ fn examples_bad_py_matches_known_findings() {
     assert_eq!(count(&diags, "B006"), 1);
     assert_eq!(count(&diags, "E711"), 1);
     assert_eq!(count(&diags, "E722"), 1);
-    assert_eq!(diags.len(), 5);
+    assert_eq!(count(&diags, "D103"), 2);
+    assert_eq!(diags.len(), 7);
 }
 
 #[test]
