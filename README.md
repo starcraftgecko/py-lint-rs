@@ -39,6 +39,27 @@ import statements where *every* bound name is unused are touched. A
 spans multiple lines, is left alone for manual review rather than risk an
 unsafe edit. Nothing else in the file is modified.
 
+#### Safe auto-fix with automatic rollback
+
+`--fix` alone only does detect/diff/apply. For a full safety net around it -
+apply, rerun this repo's test suite, and automatically revert on failure -
+use the wrapper script instead:
+
+```sh
+pwsh scripts/safe-fix.ps1 -Path examples/bad.py
+```
+
+Flow: refuse to run if the target has uncommitted changes (no clean
+rollback baseline otherwise) -> build -> `--fix` (detect, diff, apply) ->
+`cargo test` -> if tests fail, `git checkout` the target automatically and
+exit non-zero; if they pass, leave the fix in place and exit zero.
+
+This lives outside the Rust binary on purpose: "rerun tests" is specific to
+whichever project owns the file being fixed. This repo's own `cargo test`
+suite (which includes fixture-locking regression tests) is the verification
+oracle for its own example files; a real deployment would swap in that
+project's test command instead.
+
 Exit codes: `0` no issues, `1` issues found, `2` a file failed to parse/read.
 
 ## Building

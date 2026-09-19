@@ -235,4 +235,40 @@ mod tests {
         let source = "import os\nprint(os.getcwd())\n";
         assert!(fixes(source).is_empty());
     }
+
+    #[test]
+    fn removes_indented_import_preserving_surrounding_lines() {
+        // The import lives inside an `if` block; deleting its whole physical
+        // line must not disturb the indentation of the lines around it.
+        let source = "if True:\n    import os\n    print(1)\n";
+        let f = fixes(source);
+        assert_eq!(f.len(), 1);
+        assert_eq!(apply_fixes(source, &f), "if True:\n    print(1)\n");
+    }
+
+    #[test]
+    fn removes_multiple_fully_dead_imports_in_one_pass() {
+        let source = "import os\nimport json\nprint(1)\n";
+        let f = fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(apply_fixes(source, &f), "print(1)\n");
+    }
+
+    #[test]
+    fn known_limitation_dunder_all_reference_is_not_treated_as_usage() {
+        // KNOWN LIMITATION: usage is detected only via AST `Name` nodes.
+        // A name mentioned solely as a string in `__all__` (a common
+        // re-export convention) is invisible to this check, so the import
+        // is (incorrectly) treated as dead here. This test pins down the
+        // current behavior so it doesn't change silently; see the
+        // "next recommendations" note about excluding `__all__`-referenced
+        // names from auto-fix before this prototype is trusted more broadly.
+        let source = "import os\n\n__all__ = [\"os\"]\n";
+        let f = fixes(source);
+        assert_eq!(
+            f.len(),
+            1,
+            "documents that __all__ string references are not recognized as usage yet"
+        );
+    }
 }
