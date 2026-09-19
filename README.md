@@ -10,9 +10,9 @@ and walks the AST looking for common issues.
 
 | Code | Description |
 | ---- | ----------- |
-| `F401` | Imported name is never used |
+| `F401` | Imported name is never used (auto-fixable) |
 | `B006` | Mutable (`list`/`dict`/`set`) default argument |
-| `E711` | Comparison to `None` using `==`/`!=` instead of `is`/`is not` |
+| `E711` | Comparison to `None` using `==`/`!=` instead of `is`/`is not` (auto-fixable) |
 | `E722` | Bare `except:` clause |
 | `E501` | Line too long (> 100 characters) |
 | `D103` | Public top-level function is missing a docstring (functions named with a leading `_` are ignored) |
@@ -25,19 +25,30 @@ cargo run -- path/to/file_or_directory
 
 With no arguments, it lints the current directory recursively.
 
-### Auto-fix (prototype, F401 only)
+### Auto-fix (prototype: F401 and E711 only)
 
 ```sh
 cargo run -- --fix path/to/file_or_directory
 ```
 
-Detects fully-unused `import`/`from ... import ...` statements, prints a diff
-of the line(s) it will remove, then applies the change and re-lints the
-result. Scope is intentionally narrow for safety: only whole, single-line
-import statements where *every* bound name is unused are touched. A
-`from x import a, b` statement where only `a` is dead, or an import that
-spans multiple lines, is left alone for manual review rather than risk an
-unsafe edit. Nothing else in the file is modified.
+Two independent fixers, each narrowly scoped, sharing one diff/apply engine
+([src/fix.rs](src/fix.rs)):
+
+- **F401** - removes fully-unused, single-line `import`/`from ... import ...`
+  statements. A `from x import a, b` statement where only `a` is dead, or an
+  import that spans multiple lines, is left alone rather than risk an unsafe
+  edit.
+- **E711** - rewrites `x == None` / `x != None` to `x is None` / `x is not
+  None`. Only simple two-operand comparisons are touched (a chained
+  comparison like `a == None == b` is refused as ambiguous), and only when
+  the operator has whitespace on both sides in the source (rewriting
+  `x==None` to `xisNone` would corrupt the file, so that's refused too).
+
+Both fixers print a diff of every change before writing the file, then the
+file is re-linted so you see what's left. No other rule has an auto-fix yet.
+Adding a third fixer means writing one more `find_*` function in
+[src/fix.rs](src/fix.rs) - the diff renderer and the apply step are already
+generic over any mix of whole-line deletions and in-place substitutions.
 
 #### Safe auto-fix with automatic rollback
 

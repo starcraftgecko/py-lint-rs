@@ -20,10 +20,10 @@ struct Cli {
     #[arg(default_value = ".")]
     paths: Vec<PathBuf>,
 
-    /// Remove fully-unused import statements (F401 only). Prints a diff of
-    /// what will be removed before writing the file. Only whole, single-line
-    /// import statements where every bound name is unused are touched;
-    /// partially-unused or multi-line imports are left for manual review.
+    /// Apply safe auto-fixes: unused imports (F401) and `== None`/`!= None`
+    /// comparisons (E711). Prints a diff of every change before writing the
+    /// file. Each fixer refuses ambiguous or unsafe cases on its own terms
+    /// (see README) rather than guessing; everything else is left alone.
     #[arg(long)]
     fix: bool,
 }
@@ -53,7 +53,8 @@ fn lint_file(path: &Path, apply_fix: bool) -> anyhow::Result<Vec<diagnostics::Di
 
     if apply_fix {
         let line_index = LineIndex::new(&source);
-        let fixes = fix::find_unused_import_fixes(&source, &line_index)?;
+        let mut fixes = fix::find_unused_import_fixes(&source, &line_index)?;
+        fixes.extend(fix::find_none_comparison_fixes(&source, &line_index)?);
         if !fixes.is_empty() {
             println!("{}", format!("--- {}", path.display()).bold());
             print!("{}", fix::render_diff(&source, &fixes));
