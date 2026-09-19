@@ -20,10 +20,11 @@ struct Cli {
     #[arg(default_value = ".")]
     paths: Vec<PathBuf>,
 
-    /// Apply safe auto-fixes: unused imports (F401) and `== None`/`!= None`
-    /// comparisons (E711). Prints a diff of every change before writing the
-    /// file. Each fixer refuses ambiguous or unsafe cases on its own terms
-    /// (see README) rather than guessing; everything else is left alone.
+    /// Apply safe auto-fixes: unused imports (F401), `== None`/`!= None`
+    /// comparisons (E711), and mutable default arguments (B006). Prints a
+    /// diff of every change before writing the file. Each fixer refuses
+    /// ambiguous or unsafe cases on its own terms (see README) rather than
+    /// guessing; everything else is left alone.
     #[arg(long)]
     fix: bool,
 }
@@ -55,6 +56,7 @@ fn lint_file(path: &Path, apply_fix: bool) -> anyhow::Result<Vec<diagnostics::Di
         let line_index = LineIndex::new(&source);
         let mut fixes = fix::find_unused_import_fixes(&source, &line_index)?;
         fixes.extend(fix::find_none_comparison_fixes(&source, &line_index)?);
+        fixes.extend(fix::find_mutable_default_fixes(&source, &line_index)?);
         if !fixes.is_empty() {
             println!("{}", format!("--- {}", path.display()).bold());
             print!("{}", fix::render_diff(&source, &fixes));

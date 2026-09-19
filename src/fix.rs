@@ -251,16 +251,203 @@ pub fn find_none_comparison_fixes(source: &str, line_index: &LineIndex) -> anyho
 }
 
 // ---------------------------------------------------------------------
+// B006 - hoist a mutable default argument into a `None` guard
+// ---------------------------------------------------------------------
+//
+// `def f(x=[]):` becomes:
+//     def f(x=None):
+//         if x is None:
+//             x = []
+//
+// This is a fundamentally different shape of edit from the two fixers
+// above: it *inserts* a new statement rather than deleting or substituting
+// existing text. Each fixed function produces two `Fix`es - a same-line
+// substitution (the default -> `None`) and a zero-width insertion (the new
+// guard statement) - so `apply_fixes` needed no changes at all (a zero-width
+// span is just an edit that removes nothing). `render_diff` is a different
+// story: see the note above its insertion branch.
+
+fn is_docstring_stmt(stmt: &ast::Stmt) -> bool {
+    matches!(
+        stmt,
+        ast::Stmt::Expr(e) if matches!(e.value.as_ref(), ast::Expr::Constant(c) if matches!(c.value, ast::Constant::Str(_)))
+    )
+}
+
+/// Returns the exact leading whitespace of the line `stmt_start` sits on,
+/// or `None` if anything other than whitespace precedes it on that line
+/// (e.g. `def f(x=[]): return x` on one line, or a `;`-separated compound
+/// statement) - inserting a new sibling statement "before" code like that
+/// can't be done safely as a text edit, so callers must refuse instead.
+fn statement_indent(source: &str, stmt_start: usize) -> Option<&str> {
+    let line_start = line_start_offset(source, stmt_start);
+    let prefix = &source[line_start..stmt_start];
+    prefix
+        .chars()
+        .all(|c| c == ' ' || c == '\t')
+        .then_some(prefix)
+}
+
+struct MutableDefaultCollector<'a> {
+    source: &'a str,
+    line_index: &'a LineIndex,
+    fixes: Vec<Fix>,
+}
+
+impl<'a> MutableDefaultCollector<'a> {
+    fn new(source: &'a str, line_index: &'a LineIndex) -> Self {
+        Self {
+            source,
+            line_index,
+            fixes: Vec::new(),
+        }
+    }
+
+    fn handle_function(&mut self, args: &ast::Arguments, body: &[ast::Stmt]) {
+        let all_args = args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter());
+
+        let mut mutable_defaults = Vec::new();
+        for arg in all_args {
+            let Some(default) = &arg.default else {
+                continue;
+            };
+            let is_mutable_literal = matches!(
+                default.as_ref(),
+                ast::Expr::List(_) | ast::Expr::Dict(_) | ast::Expr::Set(_)
+            );
+            if is_mutable_literal {
+                mutable_defaults.push((arg.def.arg.as_str(), default.as_ref()));
+            }
+        }
+
+        // Refuse functions with more than one mutable default for this
+        // first cut - one function needing two coordinated insertions adds
+        // real risk (ordering, combined block layout) for little payoff
+        // this early. Start small.
+        if mutable_defaults.len() != 1 {
+            return;
+        }
+        let (param_name, default_expr) = mutable_defaults[0];
+
+        let default_start = default_expr.range().start().to_usize();
+        let default_end = default_expr.range().end().to_usize();
+        let (default_start_line, _) = self.line_index.line_col(default_start);
+        let (default_end_line, _) = self.line_index.line_col(default_end);
+        if default_start_line != default_end_line {
+            // Multi-line literal default (rare) - not safe for this prototype.
+            return;
+        }
+        let default_text = &self.source[default_start..default_end];
+
+        // Insert the guard right after a leading docstring if there is one,
+        // otherwise at the very start of the body.
+        let has_docstring = body.first().is_some_and(is_docstring_stmt);
+        let insert_before_index = if has_docstring { 1 } else { 0 };
+
+        let (insert_at, indent) = if insert_before_index < body.len() {
+            let anchor_start = body[insert_before_index].range().start().to_usize();
+            let Some(indent) = statement_indent(self.source, anchor_start) else {
+                return; // shares a line with other code - refuse.
+            };
+            (line_start_offset(self.source, anchor_start), indent)
+        } else {
+            // Body is a docstring and nothing else - append right after it.
+            let last = &body[body.len() - 1];
+            let anchor_start = last.range().start().to_usize();
+            let Some(indent) = statement_indent(self.source, anchor_start) else {
+                return;
+            };
+            let anchor_end = last.range().end().to_usize();
+            (line_end_offset_inclusive_newline(self.source, anchor_end), indent)
+        };
+
+        let insert_text =
+            format!("{indent}if {param_name} is None:\n{indent}{indent}{param_name} = {default_text}\n");
+        let (insert_line, _) = self.line_index.line_col(insert_at);
+
+        self.fixes.push(Fix {
+            line: default_start_line,
+            description: format!("replace mutable default for `{param_name}` with `None`"),
+            start: default_start,
+            end: default_end,
+            replacement: "None".to_string(),
+        });
+        self.fixes.push(Fix {
+            line: insert_line,
+            description: format!("initialize `{param_name}` inside the function body instead"),
+            start: insert_at,
+            end: insert_at,
+            replacement: insert_text,
+        });
+    }
+}
+
+impl<'a> Visitor for MutableDefaultCollector<'a> {
+    fn visit_stmt_function_def(&mut self, node: ast::StmtFunctionDef) {
+        self.handle_function(&node.args, &node.body);
+        self.generic_visit_stmt_function_def(node);
+    }
+
+    fn visit_stmt_async_function_def(&mut self, node: ast::StmtAsyncFunctionDef) {
+        self.handle_function(&node.args, &node.body);
+        self.generic_visit_stmt_async_function_def(node);
+    }
+}
+
+/// Finds mutable (`list`/`dict`/`set`) default arguments safe to hoist into
+/// a `None`-guarded assignment inside the function body.
+///
+/// Scope is deliberately narrow: a function with more than one mutable
+/// default is refused outright (start small); the default literal must sit
+/// on a single physical line; and the statement the guard would be inserted
+/// before must be the sole content of its own line (a one-line function
+/// body like `def f(x=[]): return x` is refused rather than risk splicing
+/// into shared code).
+pub fn find_mutable_default_fixes(source: &str, line_index: &LineIndex) -> anyhow::Result<Vec<Fix>> {
+    let suite: Suite = Suite::parse(source, "<fix>").map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let mut collector = MutableDefaultCollector::new(source, line_index);
+    for stmt in suite {
+        collector.visit_stmt(stmt);
+    }
+
+    let mut fixes = collector.fixes;
+    fixes.sort_by_key(|f| f.start);
+    Ok(fixes)
+}
+
+// ---------------------------------------------------------------------
 // Shared diff/apply engine - identical for every fixer above.
 // ---------------------------------------------------------------------
 
 /// Renders a minimal diff of what each fix will change.
+///
+/// CRACK IN THE ABSTRACTION: this started as two cases - delete a whole
+/// line, or substitute a span within one line - both of which fit neatly
+/// because every edit lived on exactly one physical line. B006's guard
+/// insertion breaks that assumption: it's a zero-width edit whose
+/// replacement text is itself several *new* lines, with no corresponding
+/// "before" line to diff against. The line-substitution branch below would
+/// otherwise cram a multi-line block into one line of output. This needed
+/// a genuinely new branch, not a reuse of the existing ones.
 pub fn render_diff(source: &str, fixes: &[Fix]) -> String {
     let mut sorted = fixes.to_vec();
     sorted.sort_by_key(|f| f.start);
 
     let mut out = String::new();
     for fix in &sorted {
+        if fix.start == fix.end && !fix.replacement.is_empty() {
+            for inserted_line in fix.replacement.lines() {
+                out.push_str(&format!("+ {:>4} | {}\n", fix.line, inserted_line));
+            }
+            out.push_str(&format!("       ^ {}\n", fix.description));
+            continue;
+        }
+
         let line_start = line_start_offset(source, fix.start);
         let line_end = line_end_offset_inclusive_newline(source, fix.start);
         let before = &source[line_start..line_end];
@@ -511,5 +698,155 @@ mod tests {
         all.extend(find_none_comparison_fixes(source, &line_index).unwrap());
         assert_eq!(all.len(), 2);
         assert_eq!(apply_fixes(source, &all), "x = 1\nif x is None:\n    pass\n");
+    }
+
+    // -- B006 ---------------------------------------------------------------
+
+    fn mutable_default_fixes(source: &str) -> Vec<Fix> {
+        let line_index = LineIndex::new(source);
+        find_mutable_default_fixes(source, &line_index).expect("test source should parse")
+    }
+
+    #[test]
+    fn rewrites_list_default_after_docstring() {
+        let source = "def add(item, bucket=[]):\n    \"\"\"Doc.\"\"\"\n    bucket.append(item)\n    return bucket\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def add(item, bucket=None):\n    \"\"\"Doc.\"\"\"\n    if bucket is None:\n        bucket = []\n    bucket.append(item)\n    return bucket\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_dict_default_with_no_docstring() {
+        let source = "def f(x={}):\n    return x\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def f(x=None):\n    if x is None:\n        x = {}\n    return x\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_set_default() {
+        let source = "def f(x={1, 2}):\n    return x\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def f(x=None):\n    if x is None:\n        x = {1, 2}\n    return x\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_default_in_async_function() {
+        let source = "async def f(x=[]):\n    return x\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "async def f(x=None):\n    if x is None:\n        x = []\n    return x\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_keyword_only_default() {
+        let source = "def f(*, x=[]):\n    return x\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def f(*, x=None):\n    if x is None:\n        x = []\n    return x\n"
+        );
+    }
+
+    #[test]
+    fn rewrites_when_body_is_docstring_only() {
+        // No statement to insert "before" - the guard must be appended
+        // right after the docstring's own line instead.
+        let source = "def f(x=[]):\n    \"\"\"Doc.\"\"\"\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def f(x=None):\n    \"\"\"Doc.\"\"\"\n    if x is None:\n        x = []\n"
+        );
+    }
+
+    #[test]
+    fn preserves_tab_indentation() {
+        let source = "def f(x=[]):\n\treturn x\n";
+        let f = mutable_default_fixes(source);
+        assert_eq!(f.len(), 2);
+        assert_eq!(
+            apply_fixes(source, &f),
+            "def f(x=None):\n\tif x is None:\n\t\tx = []\n\treturn x\n"
+        );
+    }
+
+    #[test]
+    fn ignores_none_default() {
+        let source = "def f(x=None):\n    return x\n";
+        assert!(mutable_default_fixes(source).is_empty());
+    }
+
+    #[test]
+    fn ignores_scalar_default() {
+        let source = "def f(x=5):\n    return x\n";
+        assert!(mutable_default_fixes(source).is_empty());
+    }
+
+    #[test]
+    fn refuses_function_with_two_mutable_defaults() {
+        // Start small: two coordinated insertions in one function is
+        // deliberately out of scope for this first cut.
+        let source = "def f(x=[], y={}):\n    return x, y\n";
+        let f = mutable_default_fixes(source);
+        assert!(
+            f.is_empty(),
+            "functions with >1 mutable default must be refused, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_multiline_literal_default() {
+        let source = "def f(x=[\n    1,\n]):\n    return x\n";
+        let f = mutable_default_fixes(source);
+        assert!(
+            f.is_empty(),
+            "multi-line literal defaults must be refused, got {f:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_single_line_function_body() {
+        // The `def` line and the body share one physical line - there is no
+        // safe place to insert a new sibling statement as a text edit.
+        let source = "def f(x=[]): return x\n";
+        let f = mutable_default_fixes(source);
+        assert!(
+            f.is_empty(),
+            "one-line function bodies must be refused, got {f:?}"
+        );
+    }
+
+    // -- Composition: all three fixers together ------------------------------
+
+    #[test]
+    fn combined_fixes_from_three_rules_compose_correctly() {
+        let source = "import os\n\n\ndef get(x, cache={}):\n    if x == None:\n        return None\n    return cache.get(x)\n";
+        let line_index = LineIndex::new(source);
+        let mut all = find_unused_import_fixes(source, &line_index).unwrap();
+        all.extend(find_none_comparison_fixes(source, &line_index).unwrap());
+        all.extend(find_mutable_default_fixes(source, &line_index).unwrap());
+        assert_eq!(all.len(), 4); // 1 import delete + 1 compare rewrite + 2 for the mutable default
+
+        let fixed = apply_fixes(source, &all);
+        assert_eq!(
+            fixed,
+            "\n\ndef get(x, cache=None):\n    if cache is None:\n        cache = {}\n    if x is None:\n        return None\n    return cache.get(x)\n"
+        );
     }
 }

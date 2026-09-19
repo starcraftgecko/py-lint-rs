@@ -11,7 +11,7 @@ and walks the AST looking for common issues.
 | Code | Description |
 | ---- | ----------- |
 | `F401` | Imported name is never used (auto-fixable) |
-| `B006` | Mutable (`list`/`dict`/`set`) default argument |
+| `B006` | Mutable (`list`/`dict`/`set`) default argument (auto-fixable) |
 | `E711` | Comparison to `None` using `==`/`!=` instead of `is`/`is not` (auto-fixable) |
 | `E722` | Bare `except:` clause |
 | `E501` | Line too long (> 100 characters) |
@@ -25,14 +25,14 @@ cargo run -- path/to/file_or_directory
 
 With no arguments, it lints the current directory recursively.
 
-### Auto-fix (prototype: F401 and E711 only)
+### Auto-fix (prototype: F401, E711, B006 only)
 
 ```sh
 cargo run -- --fix path/to/file_or_directory
 ```
 
-Two independent fixers, each narrowly scoped, sharing one diff/apply engine
-([src/fix.rs](src/fix.rs)):
+Three independent fixers, each narrowly scoped, sharing one diff/apply
+engine ([src/fix.rs](src/fix.rs)):
 
 - **F401** - removes fully-unused, single-line `import`/`from ... import ...`
   statements. A `from x import a, b` statement where only `a` is dead, or an
@@ -43,12 +43,31 @@ Two independent fixers, each narrowly scoped, sharing one diff/apply engine
   comparison like `a == None == b` is refused as ambiguous), and only when
   the operator has whitespace on both sides in the source (rewriting
   `x==None` to `xisNone` would corrupt the file, so that's refused too).
+- **B006** - hoists a mutable default into a `None`-guarded assignment:
+  `def f(x=[]):` becomes `def f(x=None):` with `if x is None: x = []`
+  inserted into the body (after a leading docstring, if any). Refused when
+  a function has more than one mutable default (start small - one function
+  needing two coordinated insertions is deliberately out of scope for now),
+  when the literal default spans multiple lines, or when the insertion
+  point shares a physical line with other code (e.g. `def f(x=[]): return
+  x` written on one line) - there's no safe text edit for that last case.
 
-Both fixers print a diff of every change before writing the file, then the
-file is re-linted so you see what's left. No other rule has an auto-fix yet.
-Adding a third fixer means writing one more `find_*` function in
-[src/fix.rs](src/fix.rs) - the diff renderer and the apply step are already
-generic over any mix of whole-line deletions and in-place substitutions.
+Both F401 and E711 are pure deletions/substitutions that fit neatly into a
+"start/end span, optional replacement text" model. **B006 does not**: it
+needs to *insert* a brand-new statement, which the diff renderer had no
+representation for and had to grow a third case to handle (a zero-width
+edit whose replacement is itself multiple new lines - see the comment
+above `render_diff`). The apply step needed no changes at all; a zero-width
+span is already just "remove nothing, insert this." That asymmetry - one
+shared function needed no changes, the other needed a real extension - is
+the one crack this prototype has found in the "one engine for every fixer"
+idea so far.
+
+All fixers print a diff of every change before writing the file, then the
+file is re-linted so you see what's left. No other rule has an auto-fix
+yet. Each fixer runs its own independent AST pass (see [src/fix.rs](src/fix.rs))
+so a bug in one can't corrupt another, and all of them currently operate on
+one file at a time.
 
 #### Safe auto-fix with automatic rollback
 
