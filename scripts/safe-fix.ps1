@@ -70,7 +70,16 @@ if (-not $changed) {
 }
 
 Write-Step "Verify: rerunning cargo test"
-cargo test --quiet 2>&1 | Out-Host
+# IMPORTANT: do not redirect cargo's stderr with 2>&1 here. Under
+# $ErrorActionPreference = "Stop", PowerShell wraps a native process's
+# stderr lines into terminating ErrorRecords when redirected this way -
+# a failing `cargo test` would abort this script on the spot, *skipping
+# the rollback below*, while still printing output that looks like a
+# normal failure report. (This bug was caught during manual verification:
+# the rollback did not run and had to be done by hand.) Letting stderr
+# print directly to the console and checking $LASTEXITCODE afterward
+# avoids that trap entirely.
+cargo test --quiet
 $testsPassed = ($LASTEXITCODE -eq 0)
 
 if (-not $testsPassed) {
