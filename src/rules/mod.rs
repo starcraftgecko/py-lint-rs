@@ -10,6 +10,9 @@ use rustpython_parser::Parse;
 use crate::diagnostics::Diagnostic;
 use crate::line_index::LineIndex;
 
+#[cfg(test)]
+mod tests;
+
 struct PendingImport {
     bound_name: String,
     line: usize,
