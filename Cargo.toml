@@ -1,0 +1,12 @@
+[package]
+name = "pylint-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+colored = "3.1.1"
+rustpython-ast = { version = "0.4.0", features = ["visitor"] }
+rustpython-parser = "0.4.0"
+walkdir = "2.5.0"
